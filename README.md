@@ -7,6 +7,10 @@
 - 产出继承投入的过敏原/待确认状态，并继承**设备上一次加工的残留**；
   只有两次加工之间**已验证且未撤销**的清洗才清除残留；
 - 查询任一批次，返回**每项过敏原与待确认状态的来源路径**及当前有效依据；
+- 原料声明更正、清洗撤销正式落库前可先**预演（不落库）**：返回确有差异的下游
+  批次（过敏原、待确认状态、来源路径及依据的前后变化，设备残留传播同样计入）、
+  这些批次**已签发标签**相对变更前后实时结论的差异，以及一次性提交凭据；
+  提交时若影响差异的记录已变化则拒绝（需重新预演），无关记录更新不使凭据失效；
 - 原料声明更正、清洗撤销后，**未签发结论按当前有效记录实时重算**；
 - **签发标签**冻结签发时刻的结论与依据，后续变更不改旧标签，
   可签发关联旧版（`supersedes_id`）的新标签；
@@ -74,18 +78,65 @@ pytest tests/ -q
 | POST | `/materials` | 登记原料批次（过敏原集合或待确认状态） |
 | GET | `/materials` / `/materials/{batch_id}` | 查询原料批次及当前有效声明 |
 | POST | `/materials/{batch_id}/declarations` | 更正声明（追加新版本） |
+| POST | `/materials/{batch_id}/declarations/preview` | 声明更正预演（不落库），返回差异报告 + 提交凭据 |
 | POST | `/processings` | 登记加工批次（含全部校验） |
 | GET | `/processings` / `/processings/{id}` | 查询加工批次 |
 | POST | `/cleanings` | 登记设备清洗（`verified` 标记是否已验证） |
 | GET | `/cleanings` / `/cleanings/{id}` | 查询清洗记录（可按 `?equipment_id=` 过滤） |
 | POST | `/cleanings/{id}/revoke` | 撤销清洗验证 |
+| POST | `/cleanings/{id}/revoke/preview` | 清洗撤销预演（不落库），返回差异报告 + 提交凭据 |
+| POST | `/previews/{preview_id}/commit` | 凭预演凭据原子应用变更（一次性） |
 | GET | `/batches/{batch_id}/trace` | 实时溯源：每项过敏原/待确认的来源路径 + 依据 |
 | POST | `/batches/{batch_id}/labels` | 签发标签（可带 `supersedes_id` 关联旧版） |
 | GET | `/batches/{batch_id}/labels` / `/labels/{id}` | 查询标签 |
 
 错误约定：`400` 无效时序/参数（如投入批次在加工开始前不可用）；
-`404` 资源不存在；`409` 冲突（设备时间重叠、来源环、批次号占用、重复撤销）；
+`404` 资源不存在；`409` 冲突（设备时间重叠、来源环、批次号占用、重复撤销、
+预演凭据不存在/已使用/已过期，或影响差异的记录已变化需重新预演）；
 `422` 请求格式错误（如时间缺少时区）。所有时间必须为带时区的 ISO8601（建议 UTC `Z`）。
+
+## 变更预演（dry-run）与凭据提交
+
+在**原料声明更正**或**清洗撤销**正式落库前，可先对“拟变更”进行预演。预演只在
+内存中叠加假设状态重算，**不写库**；已有更正、撤销与标签查询接口完全兼容，
+已签发标签永不改写。
+
+预演响应（`dry_run=true, applied=false`）包含：
+
+- `preview_id`：提交凭据（进程内一次性令牌，服务重启后失效，需重新预演）；
+- `change`：拟应用的变更（类型、目标、新版本号/清洗记录等）；
+- `affected_batches[]`：仅列**变更前后确有差异**的批次（含原料目标本身；
+  设备残留传播的下游批次同样计入），每项含：
+  - `before` / `after`：完整实时结论（过敏原集合、待确认、逐项来源路径）与依据
+    （命中的原料声明版本、赖以清除残留的清洗）；
+  - `diff`：结论差异（过敏原 `added/removed`、`pending` 翻转、来源路径前后对照）
+    与依据差异（声明版本、清洗依据的前后对照）；
+  - `issued_labels[]`：该批次每张已签发标签的冻结结论，以及
+    `diff_vs_before` / `diff_vs_after`（标签相对变更前、变更后实时结论的差异，
+    无差异为 `null`）；
+- `commit`：提交方法与路径。
+
+提交 `POST /previews/{preview_id}/commit` 在单个 `BEGIN IMMEDIATE` 事务内重新核对
+指纹并写入：若**影响本次差异**的记录（目标/路径上的原料声明版本、相关加工及其
+残留窗口内有效的清洗、受影响批次的已签发标签）与预演时一致，则原子应用并返回
+实际影响报告（`dry_run=false, applied=true`，结构与预演相同）；否则 `409` 拒绝、
+不落库并要求重新预演。无关记录（其他原料/设备上的加工、窗口内未验证或已撤销的
+清洗、不受影响批次的标签等）的新增更新**不会**使凭据失效。
+
+```bash
+BASE=http://localhost:8000
+
+# 预演声明更正（过敏原 + 待确认），不落库
+curl -s $BASE/materials/RM-OAT/declarations/preview -X POST \
+  -H 'Content-Type: application/json' \
+  -d '{"allergens": ["gluten", "sesame"], "pending": false}'
+
+# 预演清洗撤销（设备残留恢复计入下游批次）
+curl -s $BASE/cleanings/1/revoke/preview -X POST
+
+# 用上一步返回的 preview_id 原子提交（返回实际影响）
+curl -s $BASE/previews/<preview_id>/commit -X POST
+```
 
 ## 调用示例（curl）
 
@@ -129,6 +180,12 @@ curl -s $BASE/materials/RM-OAT/declarations -X POST \
   -H 'Content-Type: application/json' \
   -d '{"allergens": ["gluten", "sesame"]}'
 
+# 6b. 也可以先预演再凭凭据提交（预演不落库；示例见上节“变更预演”）
+curl -s $BASE/materials/RM-OAT/declarations/preview -X POST \
+  -H 'Content-Type: application/json' \
+  -d '{"allergens": ["gluten", "sesame", "soy"]}'
+# -> 返回 preview_id 后：curl -s $BASE/previews/<preview_id>/commit -X POST
+
 # 7. 签发标签（冻结当前结论）；变更后签发关联旧版的新标签
 curl -s $BASE/batches/OUT-OAT-1/labels -X POST \
   -H 'Content-Type: application/json' -d '{}'
@@ -145,7 +202,7 @@ app/
   service.py   # 业务规则：校验、溯源计算、标签签发
   db.py        # SQLite 连接、建表、写事务
   schemas.py   # 请求模型（强制时区感知时间）
-tests/test_app.py   # 19 个端到端测试
+tests/test_app.py   # 28 个端到端测试
 examples/demo.sh    # 全流程 curl 演示
 Dockerfile / docker-compose.yml / requirements*.txt
 ```

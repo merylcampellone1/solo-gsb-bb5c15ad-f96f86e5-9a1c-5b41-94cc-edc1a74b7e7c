@@ -52,3 +52,21 @@ step "8. 非法登记示例（均被拒绝且不影响已有数据）"
 req POST /processings '{"processing_id":"P-BAD","equipment_id":"EQ-1","start_utc":"2026-01-02T08:30:00Z","end_utc":"2026-01-02T09:30:00Z","inputs":["RM-OAT"],"outputs":["OUT-X"]}'
 req POST /processings '{"processing_id":"P-LOOP","equipment_id":"EQ-9","start_utc":"2026-01-02T08:00:00Z","end_utc":"2026-01-02T09:00:00Z","inputs":["RM-OAT"],"outputs":["RM-OAT"]}'
 req POST /processings '{"processing_id":"P-TIME","equipment_id":"EQ-9","start_utc":"2026-01-02T09:00:00Z","end_utc":"2026-01-02T08:00:00Z","inputs":["RM-OAT"],"outputs":["OUT-Y"]}'
+
+step "9. 声明更正预演（不落库）：查看差异与已签发标签偏差，取得提交凭据"
+req POST /materials/RM-OAT/declarations/preview '{"allergens":["gluten","sesame","tree-nut"]}'
+
+step "10. 清洗撤销预演（不落库）：设备残留恢复，含下游批次与标签差异"
+# 先补一条 EQ-1 的已验证清洗（步骤 5 的清洗已被直接撤销）
+CID="$(curl -sS -X POST "$BASE/cleanings" -H 'Content-Type: application/json' \
+  -d '{"equipment_id":"EQ-1","cleaned_at":"2026-01-02T09:20:00Z","verified":true}' \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')"
+req POST "/cleanings/$CID/revoke/preview"
+
+step "11. 凭预演凭据原子提交（取上一步返回的 preview_id）"
+PID="$(curl -sS -X POST "$BASE/cleanings/$CID/revoke/preview" | python3 -c 'import sys,json;print(json.load(sys.stdin)["preview_id"])')"
+req POST "/previews/$PID/commit"
+step "已签发标签仍不改写"
+req GET /labels/1
+step "凭据一次性：再次提交将被拒绝"
+req POST "/previews/$PID/commit"

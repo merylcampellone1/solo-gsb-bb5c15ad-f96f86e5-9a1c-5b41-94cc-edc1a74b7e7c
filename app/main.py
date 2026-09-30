@@ -12,6 +12,7 @@ from . import db, service
 from .schemas import (
     CleaningCreate,
     DeclarationCreate,
+    DeclarationPreviewCreate,
     LabelCreate,
     MaterialCreate,
     ProcessingCreate,
@@ -26,9 +27,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="过敏原溯源服务",
-    version="1.0.0",
+    version="1.1.0",
     description="共线生产食品批次的过敏原与待确认状态溯源：原料声明、加工登记、"
-                "设备残留与清洗、来源路径查询、标签签发。",
+                "设备残留与清洗、来源路径查询、标签签发，以及声明更正/清洗撤销的"
+                "预演与凭据提交。",
     lifespan=lifespan,
 )
 
@@ -87,6 +89,14 @@ def add_declaration(batch_id: str, data: DeclarationCreate, conn=Depends(get_con
     return service.add_declaration(conn, batch_id, data)
 
 
+@app.post("/materials/{batch_id}/declarations/preview", status_code=200, tags=["预演"])
+def preview_declaration(batch_id: str, data: DeclarationPreviewCreate,
+                        conn=Depends(get_conn)):
+    """声明更正预演（不落库）：返回确有差异的下游批次（过敏原/待确认/来源路径/依据）
+    及其已签发标签相对变更前后实时结论的差异，并给出提交凭据。"""
+    return service.preview_declaration(conn, batch_id, data)
+
+
 # ---------------------------------------------------------------- 加工批次
 
 @app.post("/processings", status_code=201, tags=["加工"])
@@ -131,6 +141,22 @@ def get_cleaning(cleaning_id: int, conn=Depends(get_conn)):
 def revoke_cleaning(cleaning_id: int, conn=Depends(get_conn)):
     """撤销清洗验证。撤销后未签发结论实时重算（残留恢复）；已签发标签不变。"""
     return service.revoke_cleaning(conn, cleaning_id)
+
+
+@app.post("/cleanings/{cleaning_id}/revoke/preview", status_code=200, tags=["预演"])
+def preview_revoke_cleaning(cleaning_id: int, conn=Depends(get_conn)):
+    """清洗撤销预演（不落库）：返回确有差异的下游批次（含设备残留传播）
+    及其已签发标签相对变更前后实时结论的差异，并给出提交凭据。"""
+    return service.preview_revoke_cleaning(conn, cleaning_id)
+
+
+# ---------------------------------------------------------------- 预演提交
+
+@app.post("/previews/{preview_id}/commit", tags=["预演"])
+def commit_preview(preview_id: str, conn=Depends(get_conn)):
+    """凭预演凭据原子应用变更：影响本次差异的记录已变化则 409（需重新预演），
+    无关记录更新不使凭据失效。返回实际影响（与预演同口径）。"""
+    return service.commit_preview(conn, preview_id)
 
 
 # ---------------------------------------------------------------- 溯源查询

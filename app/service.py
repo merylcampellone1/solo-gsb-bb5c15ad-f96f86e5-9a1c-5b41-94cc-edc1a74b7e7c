@@ -1,4 +1,4 @@
-"""核心业务逻辑：登记、校验（时序/可用性/重叠/来源环）、溯源计算、标签签发。
+"""核心业务逻辑：登记、校验（时序/可用性/重叠/来源环）、溯源计算、标签签发、变更预演。
 
 溯源模型
 --------
@@ -7,8 +7,17 @@
   若两次加工之间存在“已验证且未撤销”的清洗，则残留被清除。
 - 来源路径：从声明起点到目标批次的链路，逐步标注经由哪个加工、
   是“投入(input)”还是“设备残留(equipment_residue)”。
+
+预演模型
+--------
+声明更正/清洗撤销正式落库前可先预演：在内存视图上叠加“假设变更”
+（decl_overrides / extra_revoked_cleanings）重算，不落库任何业务数据；
+预演返回带凭据的差异报告，提交时核对影响本次差异的记录是否仍与预演时一致，
+一致才原子应用，否则 409 拒绝并要求重新预演。
 """
+import hashlib
 import json
+import secrets
 import sqlite3
 from datetime import datetime, timezone
 
@@ -322,8 +331,16 @@ def revoke_cleaning(conn: sqlite3.Connection, cleaning_id: int) -> dict:
 
 # ---------------------------------------------------------------- 溯源计算
 
-def compute_trace(conn: sqlite3.Connection, batch_id: str):
+def compute_trace(conn: sqlite3.Connection, batch_id: str,
+                  decl_overrides: dict | None = None,
+                  extra_revoked_cleanings: set | None = None):
     """按当前有效记录实时计算批次结论。
+
+    decl_overrides: {batch_id: {"allergens": [...], "pending": bool,
+                                "version": int, "declared_at": str}}
+        预演用：用“拟更正后的新版本声明”覆盖该原料的当前有效声明（不落库）。
+    extra_revoked_cleanings: set[int]
+        预演用：把这些清洗记录视为已撤销（不落库）。
 
     返回 (result, evidence)：
     - result: {"allergens": {过敏原: [路径...]}, "pending_paths": [路径...]}
@@ -333,6 +350,8 @@ def compute_trace(conn: sqlite3.Connection, batch_id: str):
       {"batch_id": "OUT-1", "processing_id": "P1", "via": "input"}
       {"batch_id": "OUT-2", "processing_id": "P2", "via": "equipment_residue", "equipment_id": "EQ-1"}
     """
+    decl_overrides = decl_overrides or {}
+    extra_revoked_cleanings = extra_revoked_cleanings or set()
     evidence = {"materials": {}, "cleanings": {}}
     memo: dict[str, dict] = {}
 
@@ -340,19 +359,29 @@ def compute_trace(conn: sqlite3.Connection, batch_id: str):
         if bid in memo:
             return memo[bid]
         if _material(conn, bid):
-            decl = _current_declaration(conn, bid)
-            allergens = json.loads(decl["allergens"])
+            if bid in decl_overrides:
+                ov = decl_overrides[bid]
+                allergens = list(ov["allergens"])
+                pending = int(ov["pending"])
+                version = ov["version"]
+                declared_at = ov["declared_at"]
+            else:
+                decl = _current_declaration(conn, bid)
+                allergens = json.loads(decl["allergens"])
+                pending = decl["pending"]
+                version = decl["version"]
+                declared_at = decl["declared_at"]
             evidence["materials"][bid] = {
                 "batch_id": bid,
-                "version": decl["version"],
+                "version": version,
                 "allergens": allergens,
-                "pending": bool(decl["pending"]),
-                "declared_at": iso_z(decl["declared_at"]),
+                "pending": bool(pending),
+                "declared_at": iso_z(declared_at),
             }
             step = {"batch_id": bid, "via": "declaration"}
             res = {
                 "allergens": {a: [[step]] for a in allergens},
-                "pending_paths": [[step]] if decl["pending"] else [],
+                "pending_paths": [[step]] if pending else [],
             }
         else:
             out = _output_of(conn, bid)
@@ -391,7 +420,7 @@ def compute_trace(conn: sqlite3.Connection, batch_id: str):
                     " ORDER BY cleaned_at LIMIT 1",
                     (proc["equipment_id"], prev["end_utc"], proc["start_utc"]),
                 ).fetchone()
-                if cleaning:
+                if cleaning and cleaning["id"] not in extra_revoked_cleanings:
                     evidence["cleanings"][cleaning["id"]] = {
                         "id": cleaning["id"],
                         "equipment_id": cleaning["equipment_id"],
@@ -416,24 +445,49 @@ def compute_trace(conn: sqlite3.Connection, batch_id: str):
     return result, evidence
 
 
+def conclusion_view(result: dict) -> dict:
+    """把 compute_trace 的 result 规整为对外一致的“结论”结构
+    （trace 响应与标签快照共用，保证比对口径一致）。"""
+    return {
+        "pending": bool(result["pending_paths"]),
+        "allergens": sorted(result["allergens"].keys()),
+        "allergen_paths": {a: result["allergens"][a]
+                           for a in sorted(result["allergens"])},
+        "pending_paths": result["pending_paths"],
+    }
+
+
+def basis_view(evidence: dict) -> dict:
+    return {
+        "material_declarations": sorted(
+            evidence["materials"].values(), key=lambda d: d["batch_id"]),
+        "cleanings": sorted(
+            evidence["cleanings"].values(), key=lambda d: d["id"]),
+    }
+
+
+def trace_view(conn: sqlite3.Connection, batch_id: str,
+               decl_overrides: dict | None = None,
+               extra_revoked_cleanings: set | None = None) -> dict:
+    """完整实时视图：结论（含来源路径）+ 依据。可叠加预演覆盖。"""
+    result, evidence = compute_trace(
+        conn, batch_id, decl_overrides, extra_revoked_cleanings)
+    return {
+        "conclusion": conclusion_view(result),
+        "basis": basis_view(evidence),
+    }
+
+
 def trace_response(conn: sqlite3.Connection, batch_id: str) -> dict:
     kind, _ = batch_kind(conn, batch_id)
     if not kind:
         raise NotFound(f"未知批次: {batch_id}")
-    result, evidence = compute_trace(conn, batch_id)
+    view = trace_view(conn, batch_id)
     return {
         "batch_id": batch_id,
         "kind": kind,
-        "pending": bool(result["pending_paths"]),
-        "allergens": sorted(result["allergens"].keys()),
-        "allergen_paths": {a: result["allergens"][a] for a in sorted(result["allergens"])},
-        "pending_paths": result["pending_paths"],
-        "basis": {
-            "material_declarations": sorted(
-                evidence["materials"].values(), key=lambda d: d["batch_id"]),
-            "cleanings": sorted(
-                evidence["cleanings"].values(), key=lambda d: d["id"]),
-        },
+        **view["conclusion"],
+        "basis": view["basis"],
     }
 
 
@@ -454,22 +508,11 @@ def issue_label(conn: sqlite3.Connection, batch_id: str, supersedes_id: int | No
                     f"旧标签 {supersedes_id} 属于批次 {old['batch_id']}，"
                     f"不能关联到批次 {batch_id} 的新标签")
         # 签发时刻冻结结论与依据
-        result, evidence = compute_trace(conn, batch_id)
+        view = trace_view(conn, batch_id)
         snapshot = {
             "batch_id": batch_id,
-            "conclusion": {
-                "pending": bool(result["pending_paths"]),
-                "allergens": sorted(result["allergens"].keys()),
-                "allergen_paths": {a: result["allergens"][a]
-                                   for a in sorted(result["allergens"])},
-                "pending_paths": result["pending_paths"],
-            },
-            "basis": {
-                "material_declarations": sorted(
-                    evidence["materials"].values(), key=lambda d: d["batch_id"]),
-                "cleanings": sorted(
-                    evidence["cleanings"].values(), key=lambda d: d["id"]),
-            },
+            "conclusion": view["conclusion"],
+            "basis": view["basis"],
         }
         cur = conn.execute(
             "INSERT INTO labels (batch_id, issued_at, supersedes_id, snapshot)"
@@ -502,3 +545,524 @@ def list_labels(conn: sqlite3.Connection, batch_id: str) -> list[dict]:
     rows = conn.execute(
         "SELECT id FROM labels WHERE batch_id = ? ORDER BY id", (batch_id,)).fetchall()
     return [get_label(conn, r["id"]) for r in rows]
+
+
+# ---------------------------------------------------------------- 变更预演
+#
+# 预演在“当前库状态”与“叠加假设变更后的状态”两个视图上重算全部批次，
+# 不落库任何业务数据；差异报告含受影响批次的结论/路径/依据变化以及其已签发
+# 标签相对两个实时结论的差异。预演同时生成凭据：指纹只纳入“影响本次差异”
+# 的记录（声明版本、残留链路上的加工、残留判定窗口内的清洗、受影响批次的
+# 已签发标签），无关记录的更新不会使凭据失效。
+
+# 进程内存放凭据（单 worker 部署；容器/进程重启后凭据失效，需重新预演）。
+_PREVIEWS: dict[str, dict] = {}
+_PREVIEW_LIMIT = 1000
+
+
+def _all_batch_ids(conn: sqlite3.Connection) -> list[str]:
+    ids = {r["batch_id"] for r in conn.execute(
+        "SELECT batch_id FROM material_batches")}
+    ids.update(r["batch_id"] for r in conn.execute(
+        "SELECT batch_id FROM processing_outputs"))
+    return sorted(ids)
+
+
+# ---------------- 规范化比对（路径按多重集合比较，不依赖运行期顺序）
+
+def _canon_paths(paths: list) -> list[str]:
+    return sorted(json.dumps(p, sort_keys=True, ensure_ascii=False) for p in paths)
+
+
+def _canon_conclusion(c: dict) -> dict:
+    return {
+        "pending": bool(c["pending"]),
+        "allergens": sorted(c["allergens"]),
+        "allergen_paths": {a: _canon_paths(c["allergen_paths"].get(a, []))
+                           for a in sorted(c["allergens"])},
+        "pending_paths": _canon_paths(c.get("pending_paths", [])),
+    }
+
+
+def _canon_basis(b: dict) -> dict:
+    return {
+        "material_declarations": {
+            d["batch_id"]: {"version": d["version"], "allergens": sorted(d["allergens"]),
+                            "pending": bool(d["pending"]), "declared_at": d["declared_at"]}
+            for d in b.get("material_declarations", [])},
+        "cleanings": {d["id"]: {"equipment_id": d["equipment_id"],
+                                "cleaned_at": d["cleaned_at"]}
+                      for d in b.get("cleanings", [])},
+    }
+
+
+def _view_key(view: dict) -> str:
+    payload = {
+        "conclusion": _canon_conclusion(view["conclusion"]),
+        "basis": _canon_basis(view["basis"]),
+    }
+    return json.dumps(payload, sort_keys=True, ensure_ascii=False)
+
+
+# ---------------- 差异构造
+
+def _diff_conclusions(before: dict, after: dict) -> dict | None:
+    cb, ca = before["conclusion"], after["conclusion"]
+    pb = _canon_conclusion(cb)
+    pa = _canon_conclusion(ca)
+    if pb == pa:
+        return None
+    diff = {}
+    if pb["allergens"] != pa["allergens"]:
+        diff["allergens"] = {
+            "before": pb["allergens"], "after": pa["allergens"],
+            "added": sorted(set(pa["allergens"]) - set(pb["allergens"])),
+            "removed": sorted(set(pb["allergens"]) - set(pa["allergens"])),
+        }
+    if pb["pending"] != pa["pending"]:
+        diff["pending"] = {"before": pb["pending"], "after": pa["pending"]}
+    if pb["allergen_paths"] != pa["allergen_paths"]:
+        diff["allergen_paths"] = {
+            "before": cb["allergen_paths"], "after": ca["allergen_paths"]}
+    if pb["pending_paths"] != pa["pending_paths"]:
+        diff["pending_paths"] = {
+            "before": cb.get("pending_paths", []),
+            "after": ca.get("pending_paths", [])}
+    return diff or None
+
+
+def _diff_basis(before: dict, after: dict) -> dict:
+    bb, ba = _canon_basis(before["basis"]), _canon_basis(after["basis"])
+    out: dict = {"material_declarations": {}, "cleanings": {}}
+    mb, ma = bb["material_declarations"], ba["material_declarations"]
+    for bid in sorted(set(mb) | set(ma)):
+        if mb.get(bid) != ma.get(bid):
+            out["material_declarations"][bid] = {
+                "before": mb.get(bid), "after": ma.get(bid)}
+    cb_, ca_ = bb["cleanings"], ba["cleanings"]
+    for cid in sorted(set(cb_) | set(ca_)):
+        if cb_.get(cid) != ca_.get(cid):
+            out["cleanings"][str(cid)] = {
+                "before": cb_.get(cid), "after": ca_.get(cid)}
+    return out
+
+
+def _diff_views(before: dict, after: dict) -> dict | None:
+    """两个完整视图的差异（结论路径 + 依据）；完全一致返回 None。"""
+    if _view_key(before) == _view_key(after):
+        return None
+    return {
+        "conclusion": _diff_conclusions(before, after),
+        "basis": _diff_basis(before, after),
+    }
+
+
+def _diff_label_against(label_snapshot_conclusion: dict,
+                        live_view: dict) -> dict | None:
+    """已签发标签的冻结结论相对某个实时结论的差异（无差异返回 None）。"""
+    return _diff_conclusions(
+        {"conclusion": label_snapshot_conclusion},
+        {"conclusion": live_view["conclusion"]})
+
+
+# ---------------- 凭据指纹（仅纳入影响本次差异的记录）
+
+def _related_processings(conn, root_batches: set, equipment_ids: set) -> set[str]:
+    """与本次变更“相关”的加工集合：
+    - 相关设备上的全部加工（残留只在同设备相邻加工间传播）；
+    - 消费根批次（及其下游产出）的加工，沿 投入->加工->产出 闭包扩展。
+    无关设备、无关原料链上的新增加工不会进入集合，故不使凭据失效。
+    """
+    adj: dict[str, list[str]] = {}
+    for r in conn.execute(
+        "SELECT processing_id, batch_id FROM processing_inputs"
+    ):
+        adj.setdefault(r["batch_id"], []).append(r["processing_id"])
+
+    pids: set[str] = set()
+    frontier = set(root_batches)
+    for eq in equipment_ids:
+        for r in conn.execute(
+            "SELECT processing_id FROM processings WHERE equipment_id = ?", (eq,)
+        ):
+            pids.add(r["processing_id"])
+    for pid in pids:  # 相关设备上加工的产出也作为下游传播起点
+        for r in conn.execute(
+            "SELECT batch_id FROM processing_outputs WHERE processing_id = ?", (pid,)
+        ):
+            frontier.add(r["batch_id"])
+
+    while frontier:
+        b = frontier.pop()
+        for pid in adj.get(b, []):
+            if pid not in pids:
+                pids.add(pid)
+                for r in conn.execute(
+                    "SELECT batch_id FROM processing_outputs WHERE processing_id = ?",
+                    (pid,),
+                ):
+                    frontier.add(r["batch_id"])
+    return pids
+
+
+def _collect_witnesses(conn: sqlite3.Connection, affected: dict,
+                       root_batches: set, root_equipment: set,
+                       forced_cleanings: set) -> dict:
+    """抽取“影响本次差异”的记录指纹：
+    - 受影响批次溯源依据中的原料声明（+ 根原料）；
+    - 相关加工（含设备/时间窗/投入边，新增相关加工会使指纹变化）；
+    - 相关加工残留窗口内“已验证且未撤销”的清洗（+ 拟撤销目标清洗）；
+    - 受影响批次的已签发标签快照（受影响批次上新签发标签会使指纹变化）。
+    """
+    materials = set(root_batches)
+    equipment = set(root_equipment)
+    labels: dict[int, str] = {}
+
+    for bid, views in affected.items():
+        for phase in ("before", "after"):
+            view = views[phase]
+            materials.update(
+                d["batch_id"] for d in view["basis"]["material_declarations"])
+            for path_group in (list(view["conclusion"]["allergen_paths"].values())
+                              + [view["conclusion"]["pending_paths"]]):
+                for path in path_group:
+                    for step in path:
+                        if step.get("equipment_id"):
+                            equipment.add(step["equipment_id"])
+        for lab in conn.execute(
+            "SELECT id, snapshot FROM labels WHERE batch_id = ? ORDER BY id",
+            (bid,),
+        ):
+            labels[lab["id"]] = lab["snapshot"]
+
+    pids = _related_processings(conn, root_batches, equipment)
+
+    # 相关加工产出的实时溯源依据（声明版本）也纳入指纹：当预演差异为空时
+    # （如残留链路上当前无过敏原），上游声明若在预演后更正、使撤销变得有影响，
+    # 凭据仍能失效。
+    for pid in pids:
+        for r in conn.execute(
+            "SELECT batch_id FROM processing_outputs WHERE processing_id = ?", (pid,)
+        ):
+            _, ev = compute_trace(conn, r["batch_id"])
+            materials.update(ev["materials"].keys())
+
+    witness = {
+        "materials": {},
+        "processings": {},
+        "cleanings": {},
+        "labels": {str(i): labels[i] for i in sorted(labels)},
+    }
+
+    for bid in sorted(materials):
+        m = _material(conn, bid)
+        if not m:
+            witness["materials"][bid] = None
+            continue
+        decl = _current_declaration(conn, bid)
+        witness["materials"][bid] = {
+            "created_at": m["created_at"],
+            "version": decl["version"],
+            "allergens": sorted(json.loads(decl["allergens"])),
+            "pending": int(decl["pending"]),
+            "declared_at": decl["declared_at"],
+        }
+
+    cleaning_ids = set(forced_cleanings)
+    for pid in sorted(pids):
+        p = conn.execute(
+            "SELECT processing_id, equipment_id, start_utc, end_utc"
+            " FROM processings WHERE processing_id = ?", (pid,)).fetchone()
+        if not p:
+            witness["processings"][pid] = None
+            continue
+        ins = sorted(r["batch_id"] for r in conn.execute(
+            "SELECT batch_id FROM processing_inputs WHERE processing_id = ?", (pid,)))
+        outs = sorted(r["batch_id"] for r in conn.execute(
+            "SELECT batch_id FROM processing_outputs WHERE processing_id = ?", (pid,)))
+        witness["processings"][pid] = {
+            "equipment_id": p["equipment_id"],
+            "start_utc": p["start_utc"], "end_utc": p["end_utc"],
+            "inputs": ins, "outputs": outs}
+        # 该加工残留窗口内真正参与判定（已验证未撤销）的清洗
+        prev = conn.execute(
+            "SELECT end_utc FROM processings WHERE equipment_id = ? AND end_utc <= ?"
+            " ORDER BY end_utc DESC LIMIT 1",
+            (p["equipment_id"], p["start_utc"])).fetchone()
+        if prev:
+            for c in conn.execute(
+                "SELECT id FROM cleanings WHERE equipment_id = ?"
+                " AND verified = 1 AND revoked = 0"
+                " AND cleaned_at >= ? AND cleaned_at <= ?",
+                (p["equipment_id"], prev["end_utc"], p["start_utc"]),
+            ):
+                cleaning_ids.add(c["id"])
+
+    for cid in sorted(cleaning_ids):
+        c = conn.execute(
+            "SELECT id, equipment_id, cleaned_at, verified, revoked"
+            " FROM cleanings WHERE id = ?", (cid,)).fetchone()
+        witness["cleanings"][str(cid)] = (
+            None if not c else {
+                "equipment_id": c["equipment_id"], "cleaned_at": c["cleaned_at"],
+                "verified": int(c["verified"]), "revoked": int(c["revoked"])})
+    return witness
+
+
+def _fingerprint(witness: dict) -> str:
+    blob = json.dumps(witness, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+# ---------------- 预演评估与报告
+
+def _evaluate(conn: sqlite3.Connection, decl_overrides: dict,
+              extra_revoked: set, root_batches: set,
+              root_equipment: set, forced_cleanings: set) -> dict:
+    """在前后两个视图上重算全部批次，构造受影响批次报告与凭据指纹。"""
+    affected: dict[str, dict] = {}
+
+    for bid in _all_batch_ids(conn):
+        kind, _ = batch_kind(conn, bid)
+        before = trace_view(conn, bid)
+        after = trace_view(conn, bid, decl_overrides, extra_revoked)
+        if _view_key(before) != _view_key(after):
+            affected[bid] = {"kind": kind, "before": before, "after": after}
+
+    witness = _collect_witnesses(
+        conn, affected, root_batches, root_equipment, forced_cleanings)
+
+    affected_out: list[dict] = []
+    for bid in sorted(affected):
+        entry = affected[bid]
+        before, after = entry["before"], entry["after"]
+        label_reports = []
+        for lab in conn.execute(
+            "SELECT id, issued_at, supersedes_id, snapshot FROM labels"
+            " WHERE batch_id = ? ORDER BY id", (bid,),
+        ):
+            snap = json.loads(lab["snapshot"])
+            frozen = snap["conclusion"]
+            lb = _diff_label_against(frozen, before)
+            la = _diff_label_against(frozen, after)
+            if lb is not None or la is not None:
+                label_reports.append({
+                    "label_id": lab["id"],
+                    "issued_at": iso_z(lab["issued_at"]),
+                    "supersedes_id": lab["supersedes_id"],
+                    "frozen_conclusion": frozen,
+                    "diff_vs_before": lb,
+                    "diff_vs_after": la,
+                })
+        affected_out.append({
+            "batch_id": bid,
+            "kind": entry["kind"],
+            "before": before,
+            "after": after,
+            "diff": _diff_views(before, after),
+            "issued_labels": label_reports,
+        })
+
+    return {
+        "affected_batches": affected_out,
+        "witness": witness,
+        "fingerprint": _fingerprint(witness),
+    }
+
+
+def _store_preview(record: dict) -> str:
+    if len(_PREVIEWS) >= _PREVIEW_LIMIT:  # 简单淘汰最旧凭据
+        oldest = next(iter(_PREVIEWS))
+        _PREVIEWS.pop(oldest, None)
+    token = secrets.token_urlsafe(24)
+    record["preview_id"] = token
+    record["previewed_at"] = iso_z(to_store(now_utc()))
+    _PREVIEWS[token] = record
+    return token
+
+
+def _preview_report(change: dict, evaluation: dict, token: str,
+                    previewed_at: str) -> dict:
+    return {
+        "preview_id": token,
+        "previewed_at": previewed_at,
+        "dry_run": True,
+        "applied": False,
+        "change": change,
+        "affected_batches": evaluation["affected_batches"],
+        "affected_count": len(evaluation["affected_batches"]),
+        "commit": {
+            "method": "POST",
+            "path": f"/previews/{token}/commit",
+            "note": "预演不落库；凭据仅在影响本次差异的记录变化时失效。",
+        },
+    }
+
+
+# ---------------- 声明更正预演 / 提交
+
+def preview_declaration(conn: sqlite3.Connection, batch_id: str, data) -> dict:
+    declared_at = to_store(data.declared_at) if data.declared_at else to_store(now_utc())
+    m = _material(conn, batch_id)
+    if not m:
+        # 无效目标沿用现有语义：加工产出批次号 / 不存在批次均为 404
+        raise NotFound(f"未知原料批次: {batch_id}")
+    cur = _current_declaration(conn, batch_id)
+    new_version = cur["version"] + 1
+    override = {
+        "allergens": list(data.allergens),
+        "pending": bool(data.pending),
+        "version": new_version,
+        "declared_at": declared_at,
+    }
+    change = {
+        "type": "declaration_correction",
+        "batch_id": batch_id,
+        "new_version": new_version,
+        "allergens": list(data.allergens),
+        "pending": bool(data.pending),
+        "declared_at": iso_z(declared_at),
+    }
+    evaluation = _evaluate(
+        conn, {batch_id: override}, set(),
+        root_batches={batch_id}, root_equipment=set(),
+        forced_cleanings=set())
+    record = {
+        "kind": "declaration",
+        "batch_id": batch_id,
+        "payload": {"allergens": list(data.allergens),
+                    "pending": bool(data.pending),
+                    "declared_at": declared_at},
+        "fingerprint": evaluation["fingerprint"],
+    }
+    token = _store_preview(record)
+    return _preview_report(change, evaluation, token, record["previewed_at"])
+
+
+def commit_declaration(conn: sqlite3.Connection, preview_id: str) -> dict:
+    record = _PREVIEWS.get(preview_id)
+    if not record or record["kind"] != "declaration":
+        raise Conflict("预演凭据不存在、已使用或已失效，请重新预演")
+    batch_id = record["batch_id"]
+    payload = record["payload"]
+    with write_tx(conn):
+        m = _material(conn, batch_id)
+        if not m:
+            _PREVIEWS.pop(preview_id, None)
+            raise NotFound(f"未知原料批次: {batch_id}")
+        cur = _current_declaration(conn, batch_id)
+        override = {
+            "allergens": payload["allergens"],
+            "pending": payload["pending"],
+            "version": cur["version"] + 1,
+            "declared_at": payload["declared_at"],
+        }
+        evaluation = _evaluate(
+            conn, {batch_id: override}, set(),
+            root_batches={batch_id}, root_equipment=set(),
+            forced_cleanings=set())
+        if evaluation["fingerprint"] != record["fingerprint"]:
+            raise Conflict(
+                "影响本次差异的记录自预演后已变化，请重新预演后再提交"
+                "（无关记录更新不影响凭据）")
+        conn.execute(
+            "INSERT INTO material_declarations (batch_id, version, allergens, pending, declared_at)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (batch_id, cur["version"] + 1, json.dumps(payload["allergens"]),
+             int(payload["pending"]), payload["declared_at"]))
+        applied_at = iso_z(to_store(now_utc()))
+        change = {
+            "type": "declaration_correction",
+            "batch_id": batch_id,
+            "new_version": cur["version"] + 1,
+            "allergens": list(payload["allergens"]),
+            "pending": bool(payload["pending"]),
+            "declared_at": iso_z(payload["declared_at"]),
+        }
+        report = _preview_report(change, evaluation, preview_id,
+                                 record["previewed_at"])
+        _PREVIEWS.pop(preview_id, None)  # 一次性凭据
+    report["dry_run"] = False
+    report["applied"] = True
+    report["applied_at"] = applied_at
+    return report
+
+
+# ---------------- 清洗撤销预演 / 提交
+
+def preview_revoke_cleaning(conn: sqlite3.Connection, cleaning_id: int) -> dict:
+    row = conn.execute(
+        "SELECT * FROM cleanings WHERE id = ?", (cleaning_id,)).fetchone()
+    if not row:
+        raise NotFound(f"未知清洗记录: {cleaning_id}")
+    if row["revoked"]:
+        raise Conflict(f"清洗记录 {cleaning_id} 已撤销")
+    change = {
+        "type": "cleaning_revocation",
+        "cleaning_id": cleaning_id,
+        "equipment_id": row["equipment_id"],
+        "cleaned_at": iso_z(row["cleaned_at"]),
+    }
+    evaluation = _evaluate(
+        conn, {}, {cleaning_id},
+        root_batches=set(), root_equipment={row["equipment_id"]},
+        forced_cleanings={cleaning_id})
+    record = {
+        "kind": "revoke_cleaning",
+        "cleaning_id": cleaning_id,
+        "fingerprint": evaluation["fingerprint"],
+    }
+    token = _store_preview(record)
+    return _preview_report(change, evaluation, token, record["previewed_at"])
+
+
+def commit_revoke_cleaning(conn: sqlite3.Connection, preview_id: str) -> dict:
+    record = _PREVIEWS.get(preview_id)
+    if not record or record["kind"] != "revoke_cleaning":
+        raise Conflict("预演凭据不存在、已使用或已失效，请重新预演")
+    cleaning_id = record["cleaning_id"]
+    with write_tx(conn):
+        row = conn.execute(
+            "SELECT * FROM cleanings WHERE id = ?", (cleaning_id,)).fetchone()
+        if not row:
+            _PREVIEWS.pop(preview_id, None)
+            raise NotFound(f"未知清洗记录: {cleaning_id}")
+        if row["revoked"]:
+            _PREVIEWS.pop(preview_id, None)
+            raise Conflict(f"清洗记录 {cleaning_id} 已撤销")
+        evaluation = _evaluate(
+            conn, {}, {cleaning_id},
+            root_batches=set(), root_equipment={row["equipment_id"]},
+            forced_cleanings={cleaning_id})
+        if evaluation["fingerprint"] != record["fingerprint"]:
+            raise Conflict(
+                "影响本次差异的记录自预演后已变化，请重新预演后再提交"
+                "（无关记录更新不影响凭据）")
+        conn.execute("UPDATE cleanings SET revoked = 1 WHERE id = ?", (cleaning_id,))
+        applied_at = iso_z(to_store(now_utc()))
+        change = {
+            "type": "cleaning_revocation",
+            "cleaning_id": cleaning_id,
+            "equipment_id": row["equipment_id"],
+            "cleaned_at": iso_z(row["cleaned_at"]),
+        }
+        report = _preview_report(change, evaluation, preview_id,
+                                 record["previewed_at"])
+        _PREVIEWS.pop(preview_id, None)
+    report["dry_run"] = False
+    report["applied"] = True
+    report["applied_at"] = applied_at
+    return report
+
+
+def commit_preview(conn: sqlite3.Connection, preview_id: str) -> dict:
+    """预演凭据统一提交入口：按预演类型分派，原子应用并返回实际影响。"""
+    record = _PREVIEWS.get(preview_id)
+    if not record:
+        raise Conflict("预演凭据不存在、已使用或已失效，请重新预演")
+    if record["kind"] == "declaration":
+        return commit_declaration(conn, preview_id)
+    if record["kind"] == "revoke_cleaning":
+        return commit_revoke_cleaning(conn, preview_id)
+    _PREVIEWS.pop(preview_id, None)
+    raise Conflict("未知的预演类型，请重新预演")

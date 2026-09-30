@@ -311,3 +311,211 @@ def test_label_supersedes_validation(client):
 def test_unknown_batch_404(client):
     assert client.get("/batches/NOPE/trace").status_code == 404
     assert client.post("/batches/NOPE/labels", json={}).status_code == 404
+
+
+# ---------------------------------------------------------------- 预演与凭据提交
+
+def test_declaration_preview_is_dry_run_and_reports_diffs(client):
+    _build_line(client)  # EQ-1: P1(RM-MILK->OUT-1), P2(RM-OAT->OUT-2)，无清洗
+    # 预演前签发标签：冻结 gluten + milk
+    label = client.post("/batches/OUT-2/labels", json={}).json()
+    r = client.post("/materials/RM-OAT/declarations/preview",
+                    json={"allergens": ["gluten", "sesame"]})
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["dry_run"] is True and d["applied"] is False
+    assert d["change"]["type"] == "declaration_correction"
+    assert d["change"]["new_version"] == 2
+    token = d["preview_id"]
+    assert token
+    affected = {b["batch_id"]: b for b in d["affected_batches"]}
+    assert "OUT-2" in affected          # 下游批次（设备残留链外的 OUT-1 不受影响）
+    assert "OUT-1" not in affected
+    out2 = affected["OUT-2"]
+    assert out2["before"]["conclusion"]["allergens"] == ["gluten", "milk"]
+    assert out2["after"]["conclusion"]["allergens"] == ["gluten", "milk", "sesame"]
+    assert out2["diff"]["conclusion"]["allergens"]["added"] == ["sesame"]
+    basis_diff = out2["diff"]["basis"]["material_declarations"]["RM-OAT"]
+    assert basis_diff["before"]["version"] == 1
+    assert basis_diff["after"]["version"] == 2
+    # 已签发标签：与变更前实时结论一致（null），与变更后结论存在差异
+    labs = out2["issued_labels"]
+    assert len(labs) == 1 and labs[0]["label_id"] == label["label_id"]
+    assert labs[0]["diff_vs_before"] is None
+    assert labs[0]["diff_vs_after"]["allergens"]["added"] == ["sesame"]
+    # 预演不落库：声明仍为 v1，实时结论无 sesame，标签接口兼容
+    assert client.get("/materials/RM-OAT").json()["version"] == 1
+    assert "sesame" not in client.get("/batches/OUT-2/trace").json()["allergens"]
+    return token
+
+
+def test_declaration_preview_commit_applies_atomically(client):
+    token = test_declaration_preview_is_dry_run_and_reports_diffs(client)
+    label_id = client.get("/batches/OUT-2/labels").json()[0]["label_id"]
+    r = client.post(f"/previews/{token}/commit")
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["dry_run"] is False and d["applied"] is True
+    assert d["affected_count"] >= 1
+    assert client.get("/materials/RM-OAT").json()["version"] == 2
+    live = client.get("/batches/OUT-2/trace").json()
+    assert live["allergens"] == ["gluten", "milk", "sesame"]
+    # 已签发标签不改写；凭据一次性
+    assert client.get(f"/labels/{label_id}").json()[
+        "conclusion"]["allergens"] == ["gluten", "milk"]
+    assert client.post(f"/previews/{token}/commit").status_code == 409
+
+
+def test_preview_credential_invalidated_by_related_change(client):
+    _build_line(client)
+    token = client.post("/materials/RM-OAT/declarations/preview",
+                        json={"allergens": ["sesame"]}).json()["preview_id"]
+    # 影响差异的记录变化：目标原料又追加了声明版本
+    client.post("/materials/RM-OAT/declarations", json={"allergens": ["gluten"]})
+    r = client.post(f"/previews/{token}/commit")
+    assert r.status_code == 409
+    assert "重新预演" in r.json()["detail"]
+    # 落库未发生：仍是直接更正写入的内容
+    assert client.get("/materials/RM-OAT").json()["allergens"] == ["gluten"]
+
+
+def test_preview_credential_survives_unrelated_records(client):
+    _build_line(client)
+    token = client.post("/materials/RM-OAT/declarations/preview",
+                        json={"allergens": ["gluten", "sesame"]}).json()["preview_id"]
+    # 无关原料、无关设备的加工登记不应使凭据失效
+    material(client, "RM-X", allergens=["soy"])
+    assert processing(client, "PX", "EQ-X",
+                      "2026-02-02T08:00:00Z", "2026-02-02T09:00:00Z",
+                      ["RM-X"], ["OUT-X"]).status_code == 201
+    r = client.post(f"/previews/{token}/commit")
+    assert r.status_code == 200, r.text
+    assert r.json()["applied"] is True
+    assert client.get("/materials/RM-OAT").json()["version"] == 2
+
+
+def test_preview_credential_invalidated_by_new_related_processing(client):
+    _build_line(client)
+    token = client.post("/materials/RM-MILK/declarations/preview",
+                        json={"allergens": []}).json()["preview_id"]
+    # 预演后新增消费 RM-MILK 的加工 -> 实际影响面扩大，凭据必须失效
+    assert processing(client, "P3", "EQ-2",
+                      "2026-01-03T08:00:00Z", "2026-01-03T09:00:00Z",
+                      ["RM-MILK"], ["OUT-3"]).status_code == 201
+    assert client.post(f"/previews/{token}/commit").status_code == 409
+
+
+def test_preview_credential_invalidated_by_new_label(client):
+    _build_line(client)
+    token = client.post("/materials/RM-OAT/declarations/preview",
+                        json={"allergens": ["sesame"]}).json()["preview_id"]
+    # 受影响批次上新签发标签 -> 标签差异集合变化，凭据失效
+    assert client.post("/batches/OUT-2/labels", json={}).status_code == 201
+    assert client.post(f"/previews/{token}/commit").status_code == 409
+
+
+def test_revoke_preview_reports_residue_propagation_and_commit(client):
+    _build_line(client)
+    cid = client.post("/cleanings", json={
+        "equipment_id": "EQ-1", "cleaned_at": "2026-01-02T09:30:00Z",
+        "verified": True}).json()["id"]
+    # 清洗生效时签发标签（仅 gluten）
+    label_id = client.post("/batches/OUT-2/labels", json={}).json()["label_id"]
+    # 再加第三道加工：撤销清洗后残留沿 OUT-1 -> OUT-2 -> OUT-3 继续传播
+    assert processing(client, "P3", "EQ-1",
+                      "2026-01-02T12:00:00Z", "2026-01-02T13:00:00Z",
+                      ["RM-OAT"], ["OUT-3"]).status_code == 201
+    r = client.post(f"/cleanings/{cid}/revoke/preview")
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["change"]["type"] == "cleaning_revocation"
+    affected = {b["batch_id"]: b for b in d["affected_batches"]}
+    assert set(affected) == {"OUT-2", "OUT-3"}
+    out3 = affected["OUT-3"]
+    assert "milk" in out3["after"]["conclusion"]["allergens"]
+    milk_paths = out3["after"]["conclusion"]["allergen_paths"]["milk"]
+    vias = [s["via"] for s in milk_paths[0]]
+    assert vias == ["declaration", "input", "equipment_residue", "equipment_residue"]
+    # 依据变化：before 依赖清洗 cid，after 无清洗依据
+    assert str(cid) in affected["OUT-2"]["diff"]["basis"]["cleanings"]
+    # OUT-2 标签与变更前一致、与变更后相差 milk（设备残留）
+    labs = affected["OUT-2"]["issued_labels"]
+    assert labs[0]["diff_vs_before"] is None
+    assert labs[0]["diff_vs_after"]["allergens"]["added"] == ["milk"]
+    # 预演期间清洗未撤销
+    assert client.get(f"/cleanings/{cid}").json()["revoked"] is False
+    # 提交：原子应用，实际影响与预演一致
+    commit = client.post(f"/previews/{d['preview_id']}/commit")
+    assert commit.status_code == 200, commit.text
+    assert commit.json()["applied"] is True
+    assert client.get(f"/cleanings/{cid}").json()["revoked"] is True
+    assert "milk" in client.get("/batches/OUT-3/trace").json()["allergens"]
+    assert client.get(f"/labels/{label_id}").json()[
+        "conclusion"]["allergens"] == ["gluten"]
+    # 既有直接撤销接口语义不变：重复撤销 409
+    assert client.post(f"/cleanings/{cid}/revoke").status_code == 409
+
+
+def test_revoke_preview_survives_unrelated_cleaning(client):
+    _build_line(client)
+    cid = client.post("/cleanings", json={
+        "equipment_id": "EQ-1", "cleaned_at": "2026-01-02T09:30:00Z",
+        "verified": True}).json()["id"]
+    token = client.post(f"/cleanings/{cid}/revoke/preview").json()["preview_id"]
+    # 无关设备的未验证清洗不影响任何残留结论
+    client.post("/cleanings", json={
+        "equipment_id": "EQ-9", "cleaned_at": "2026-01-02T09:30:00Z",
+        "verified": False})
+    assert client.post(f"/previews/{token}/commit").status_code == 200
+
+
+def test_revoke_preview_empty_diff_guards_upstream_declarations(client):
+    # P1 的投入原料无过敏原：撤销清洗当下无差异；预演后若上游补报过敏原，
+    # 撤销将变得有影响 —— 凭据必须失效。
+    material(client, "RM-BLANK")
+    material(client, "RM-OAT", allergens=["gluten"])
+    assert processing(client, "P1", "EQ-1",
+                      "2026-01-02T08:00:00Z", "2026-01-02T09:00:00Z",
+                      ["RM-BLANK"], ["OUT-1"]).status_code == 201
+    assert processing(client, "P2", "EQ-1",
+                      "2026-01-02T10:00:00Z", "2026-01-02T11:00:00Z",
+                      ["RM-OAT"], ["OUT-2"]).status_code == 201
+    cid = client.post("/cleanings", json={
+        "equipment_id": "EQ-1", "cleaned_at": "2026-01-02T09:30:00Z",
+        "verified": True}).json()["id"]
+    prev = client.post(f"/cleanings/{cid}/revoke/preview").json()
+    # 结论（过敏原/待确认/路径）无差异，但依据（清洗）有差异 -> 仍列出
+    assert prev["affected_count"] == 1
+    entry = prev["affected_batches"][0]
+    assert entry["batch_id"] == "OUT-2"
+    assert entry["diff"]["conclusion"] is None
+    assert str(cid) in entry["diff"]["basis"]["cleanings"]
+    token = prev["preview_id"]
+    # 上游补报 milk -> 撤销将把 milk 残留带进 OUT-2（结论开始受影响）
+    client.post("/materials/RM-BLANK/declarations", json={"allergens": ["milk"]})
+    assert client.post(f"/previews/{token}/commit").status_code == 409
+    # 重新预演后可见结论差异并可提交
+    prev2 = client.post(f"/cleanings/{cid}/revoke/preview").json()
+    entry2 = [b for b in prev2["affected_batches"] if b["batch_id"] == "OUT-2"][0]
+    assert entry2["diff"]["conclusion"]["allergens"]["added"] == ["milk"]
+    assert client.post(f"/previews/{prev2['preview_id']}/commit").status_code == 200
+    assert "milk" in client.get("/batches/OUT-2/trace").json()["allergens"]
+
+
+def test_preview_invalid_targets_and_errors(client):
+    _build_line(client)
+    cid = client.post("/cleanings", json={
+        "equipment_id": "EQ-1", "cleaned_at": "2026-01-02T09:30:00Z",
+        "verified": True}).json()["id"]
+    # 无效目标沿用现有错误语义
+    assert client.post("/materials/NOPE/declarations/preview",
+                       json={"allergens": ["x"]}).status_code == 404
+    assert client.post("/materials/OUT-1/declarations/preview",
+                       json={"allergens": ["x"]}).status_code == 404  # 产出批次非原料
+    assert client.post("/cleanings/999/revoke/preview").status_code == 404
+    client.post(f"/cleanings/{cid}/revoke")
+    assert client.post(f"/cleanings/{cid}/revoke/preview").status_code == 409  # 重复撤销
+    assert client.post("/previews/bogus-token/commit").status_code == 409
+    # 请求格式错误仍为 422（时间/字段校验保持一致）
+    r = client.post("/materials/RM-OAT/declarations/preview", json={"allergens": "x"})
+    assert r.status_code == 422
