@@ -48,7 +48,30 @@ req GET /labels/1
 step "新标签反映最新结论"
 req GET /labels/2
 
-step "8. 非法登记示例（均被拒绝且不影响已有数据）"
-req POST /processings '{"processing_id":"P-BAD","equipment_id":"EQ-1","start_utc":"2026-01-02T08:30:00Z","end_utc":"2026-01-02T09:30:00Z","inputs":["RM-OAT"],"outputs":["OUT-X"]}'
+step "8. 预演：先登记一条新的已验证清洗，再预演其撤销（不落库）"
+req POST /materials '{"batch_id":"RM-RICE","allergens":[],"declared_at":"2026-01-02T06:00:00Z"}'
+req POST /processings '{"processing_id":"P10","equipment_id":"EQ-2","start_utc":"2026-01-02T08:00:00Z","end_utc":"2026-01-02T09:00:00Z","inputs":["RM-MILK"],"outputs":["OUT-R-1"]}'
+req POST /processings '{"processing_id":"P11","equipment_id":"EQ-2","start_utc":"2026-01-02T10:00:00Z","end_utc":"2026-01-02T11:00:00Z","inputs":["RM-RICE"],"outputs":["OUT-R-2"]}'
+CLEAN_ID="$(curl -sS "$BASE/cleanings" -X POST -H 'Content-Type: application/json' \
+  -d '{"equipment_id":"EQ-2","cleaned_at":"2026-01-02T09:30:00Z","verified":true}' \
+  | sed -n 's/.*"id": *\([0-9]*\).*/\1/p')"
+echo "registered cleaning id=$CLEAN_ID"
+# 清洗撤销预演：撤销后 milk 经设备残留进入 OUT-R-2
+curl -sS "$BASE/previews/cleanings/$CLEAN_ID/revocation" -X POST | tee /tmp/pv-cleaning.json; echo
+CLEAN_TOKEN="$(sed -n 's/.*"token": *"\([^"]*\)".*/\1/p' /tmp/pv-cleaning.json)"
+step "凭据提交撤销（原子应用；若受影响记录已变化会 409 要求重新预演）"
+req POST /previews/commit "{\"credential\":\"$CLEAN_TOKEN\"}"
+
+step "9. 预演：原料声明更正（OUT-R-2 将新增 sesame；已签发标签差异一并列出）"
+req POST /batches/OUT-R-2/labels '{}'
+curl -sS "$BASE/previews/material-declarations" -X POST \
+  -H 'Content-Type: application/json' \
+  -d '{"batch_id":"RM-RICE","allergens":["sesame"]}' | tee /tmp/pv-decl.json; echo
+DECL_TOKEN="$(sed -n 's/.*"token": *"\([^"]*\)".*/\1/p' /tmp/pv-decl.json)"
+req POST /previews/commit "{\"credential\":\"$DECL_TOKEN\"}"
+step "旧标签保持签发时结论，实时结论已含 sesame"
+req GET /batches/OUT-R-2/trace
+
+step "10. 非法登记示例（均被拒绝且不影响已有数据）"req POST /processings '{"processing_id":"P-BAD","equipment_id":"EQ-1","start_utc":"2026-01-02T08:30:00Z","end_utc":"2026-01-02T09:30:00Z","inputs":["RM-OAT"],"outputs":["OUT-X"]}'
 req POST /processings '{"processing_id":"P-LOOP","equipment_id":"EQ-9","start_utc":"2026-01-02T08:00:00Z","end_utc":"2026-01-02T09:00:00Z","inputs":["RM-OAT"],"outputs":["RM-OAT"]}'
 req POST /processings '{"processing_id":"P-TIME","equipment_id":"EQ-9","start_utc":"2026-01-02T09:00:00Z","end_utc":"2026-01-02T08:00:00Z","inputs":["RM-OAT"],"outputs":["OUT-Y"]}'

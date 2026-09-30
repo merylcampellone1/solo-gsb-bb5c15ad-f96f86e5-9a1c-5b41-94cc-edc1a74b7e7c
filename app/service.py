@@ -322,8 +322,31 @@ def revoke_cleaning(conn: sqlite3.Connection, cleaning_id: int) -> dict:
 
 # ---------------------------------------------------------------- 溯源计算
 
-def compute_trace(conn: sqlite3.Connection, batch_id: str):
+def _effective_window_cleaning(conn, equipment_id: str, prev_end: str,
+                               start_utc: str, revoked_cleaning_ids: set | None = None):
+    """返回两次加工之间“已验证且未撤销”的清洗 id（取窗口内最早一条）；
+    revoked_cleaning_ids 中的记录在预演时视同已撤销。无则返回 None。"""
+    row = conn.execute(
+        "SELECT id FROM cleanings WHERE equipment_id = ?"
+        " AND verified = 1 AND revoked = 0"
+        " AND cleaned_at >= ? AND cleaned_at <= ?"
+        " ORDER BY cleaned_at LIMIT 1",
+        (equipment_id, prev_end, start_utc),
+    ).fetchone()
+    if row and (not revoked_cleaning_ids or row["id"] not in revoked_cleaning_ids):
+        return row["id"]
+    return None
+
+
+def compute_trace(conn: sqlite3.Connection, batch_id: str,
+                  decl_overrides: dict | None = None,
+                  revoked_cleaning_ids: set | None = None):
     """按当前有效记录实时计算批次结论。
+
+    decl_overrides / revoked_cleaning_ids 仅供预演（不落库）使用：
+    - decl_overrides: {原料批次: (allergens 列表, pending 布尔, declared_at 入库串)}，
+      命中时视为该原料存在一个“拟签发的下一版本声明”；
+    - revoked_cleaning_ids: 清洗 id 集合，命中时视为已撤销（不清除残留）。
 
     返回 (result, evidence)：
     - result: {"allergens": {过敏原: [路径...]}, "pending_paths": [路径...]}
@@ -333,6 +356,8 @@ def compute_trace(conn: sqlite3.Connection, batch_id: str):
       {"batch_id": "OUT-1", "processing_id": "P1", "via": "input"}
       {"batch_id": "OUT-2", "processing_id": "P2", "via": "equipment_residue", "equipment_id": "EQ-1"}
     """
+    decl_overrides = decl_overrides or {}
+    revoked_cleaning_ids = revoked_cleaning_ids or set()
     evidence = {"materials": {}, "cleanings": {}}
     memo: dict[str, dict] = {}
 
@@ -341,6 +366,24 @@ def compute_trace(conn: sqlite3.Connection, batch_id: str):
             return memo[bid]
         if _material(conn, bid):
             decl = _current_declaration(conn, bid)
+            if bid in decl_overrides:
+                # 预演：拟追加的下一版本声明
+                allergens, pending_flag, declared_at = decl_overrides[bid]
+                evidence["materials"][bid] = {
+                    "batch_id": bid,
+                    "version": decl["version"] + 1,
+                    "allergens": allergens,
+                    "pending": bool(pending_flag),
+                    "declared_at": iso_z(declared_at),
+                    "proposed": True,
+                }
+                step = {"batch_id": bid, "via": "declaration"}
+                res = {
+                    "allergens": {a: [[step]] for a in allergens},
+                    "pending_paths": [[step]] if pending_flag else [],
+                }
+                memo[bid] = res
+                return res
             allergens = json.loads(decl["allergens"])
             evidence["materials"][bid] = {
                 "batch_id": bid,
@@ -384,14 +427,12 @@ def compute_trace(conn: sqlite3.Connection, batch_id: str):
                 (proc["equipment_id"], proc["start_utc"]),
             ).fetchone()
             if prev:
-                cleaning = conn.execute(
-                    "SELECT * FROM cleanings WHERE equipment_id = ?"
-                    " AND verified = 1 AND revoked = 0"
-                    " AND cleaned_at >= ? AND cleaned_at <= ?"
-                    " ORDER BY cleaned_at LIMIT 1",
-                    (proc["equipment_id"], prev["end_utc"], proc["start_utc"]),
-                ).fetchone()
-                if cleaning:
+                if cleaning_id := _effective_window_cleaning(
+                        conn, proc["equipment_id"], prev["end_utc"],
+                        proc["start_utc"], revoked_cleaning_ids):
+                    cleaning = conn.execute(
+                        "SELECT * FROM cleanings WHERE id = ?", (cleaning_id,)
+                    ).fetchone()
                     evidence["cleanings"][cleaning["id"]] = {
                         "id": cleaning["id"],
                         "equipment_id": cleaning["equipment_id"],
@@ -416,11 +457,8 @@ def compute_trace(conn: sqlite3.Connection, batch_id: str):
     return result, evidence
 
 
-def trace_response(conn: sqlite3.Connection, batch_id: str) -> dict:
-    kind, _ = batch_kind(conn, batch_id)
-    if not kind:
-        raise NotFound(f"未知批次: {batch_id}")
-    result, evidence = compute_trace(conn, batch_id)
+def build_trace_view(batch_id: str, kind: str, result: dict, evidence: dict) -> dict:
+    """将 compute_trace 的原始结果组装为溯源视图（trace 接口与预演共用）。"""
     return {
         "batch_id": batch_id,
         "kind": kind,
@@ -435,6 +473,23 @@ def trace_response(conn: sqlite3.Connection, batch_id: str) -> dict:
                 evidence["cleanings"].values(), key=lambda d: d["id"]),
         },
     }
+
+
+def trace_view(conn: sqlite3.Connection, batch_id: str,
+               decl_overrides: dict | None = None,
+               revoked_cleaning_ids: set | None = None) -> dict:
+    """实时（或按预演覆盖）组装某批次的溯源视图。"""
+    kind, _ = batch_kind(conn, batch_id)
+    if not kind:
+        raise NotFound(f"未知批次: {batch_id}")
+    result, evidence = compute_trace(
+        conn, batch_id, decl_overrides=decl_overrides,
+        revoked_cleaning_ids=revoked_cleaning_ids)
+    return build_trace_view(batch_id, kind, result, evidence)
+
+
+def trace_response(conn: sqlite3.Connection, batch_id: str) -> dict:
+    return trace_view(conn, batch_id)
 
 
 # ---------------------------------------------------------------- 标签签发

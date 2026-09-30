@@ -62,3 +62,24 @@ class CleaningCreate(BaseModel):
 
 class LabelCreate(BaseModel):
     supersedes_id: Optional[int] = None  # 关联被替代的旧标签
+
+
+class DeclarationPreviewRequest(BaseModel):
+    """原料声明更正预演请求：拟更正的原料批次及目标过敏原/待确认状态。
+    预演不落库，返回差异与提交凭据。"""
+
+    batch_id: str = Field(min_length=1)
+    allergens: list[str] = []
+    pending: bool = False
+    declared_at: Optional[AwareDatetime] = None  # 缺省取服务器当前时间
+
+    @field_validator("allergens")
+    @classmethod
+    def _v_allergens(cls, v):
+        return _clean_allergens(v)
+
+
+class PreviewCommitRequest(BaseModel):
+    """凭预演凭据提交变更。"""
+
+    credential: str = Field(min_length=1)

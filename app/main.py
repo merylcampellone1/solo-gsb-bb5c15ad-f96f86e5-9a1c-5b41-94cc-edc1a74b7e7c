@@ -8,12 +8,14 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from . import db, service
+from . import db, preview, service
 from .schemas import (
     CleaningCreate,
     DeclarationCreate,
+    DeclarationPreviewRequest,
     LabelCreate,
     MaterialCreate,
+    PreviewCommitRequest,
     ProcessingCreate,
 )
 
@@ -26,7 +28,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="过敏原溯源服务",
-    version="1.0.0",
+    version="1.1.0",
     description="共线生产食品批次的过敏原与待确认状态溯源：原料声明、加工登记、"
                 "设备残留与清洗、来源路径查询、标签签发。",
     lifespan=lifespan,
@@ -131,6 +133,33 @@ def get_cleaning(cleaning_id: int, conn=Depends(get_conn)):
 def revoke_cleaning(cleaning_id: int, conn=Depends(get_conn)):
     """撤销清洗验证。撤销后未签发结论实时重算（残留恢复）；已签发标签不变。"""
     return service.revoke_cleaning(conn, cleaning_id)
+
+
+# ---------------------------------------------------------------- 预演与凭据提交
+
+@app.post("/previews/material-declarations", tags=["预演"])
+def preview_declaration_correction(data: DeclarationPreviewRequest,
+                                   conn=Depends(get_conn)):
+    """原料声明更正**预演**（不落库）：模拟追加下一版本声明，返回变更前后确有
+    差异的下游批次（过敏原、待确认状态、来源路径、依据的变化，设备残留传播计入），
+    并列出这些批次已签发标签相对变更前后实时结论的差异。响应中的 credential
+    用于 /previews/commit 提交；影响本次差异的记录若已变化，提交将被拒绝。"""
+    return preview.preview_declaration(conn, data)
+
+
+@app.post("/previews/cleanings/{cleaning_id}/revocation", tags=["预演"])
+def preview_cleaning_revocation(cleaning_id: int, conn=Depends(get_conn)):
+    """清洗撤销**预演**（不落库）：模拟撤销该清洗的验证状态，返回确有差异的
+    下游批次及其已签发标签差异，并给出提交凭据。"""
+    return preview.preview_cleaning_revocation(conn, cleaning_id)
+
+
+@app.post("/previews/commit", tags=["预演"])
+def commit_previewed_change(data: PreviewCommitRequest, conn=Depends(get_conn)):
+    """凭预演凭据原子应用变更：影响本次差异的记录已变化 → 409 要求重新预演；
+    无关记录更新不使凭据失效。返回实际影响。无效目标/不合法变更沿用既有
+    404/409 错误语义；已签发标签不被改写。"""
+    return preview.commit_change(conn, data.credential)
 
 
 # ---------------------------------------------------------------- 溯源查询

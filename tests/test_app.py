@@ -311,3 +311,215 @@ def test_label_supersedes_validation(client):
 def test_unknown_batch_404(client):
     assert client.get("/batches/NOPE/trace").status_code == 404
     assert client.post("/batches/NOPE/labels", json={}).status_code == 404
+
+
+# ---------------------------------------------------------------- 预演与凭据提交
+
+def _two_step_line(client, verified_cleaning=True):
+    """EQ-1: P1(RM-MILK -> OUT-1) 08-09, P2(RM-OAT -> OUT-2) 10-11，
+    两次加工之间登记已验证清洗（milk 残留被清除）。"""
+    material(client, "RM-MILK", allergens=["milk"])
+    material(client, "RM-OAT", allergens=["gluten"])
+    assert processing(client, "P1", "EQ-1",
+                      "2026-01-02T08:00:00Z", "2026-01-02T09:00:00Z",
+                      ["RM-MILK"], ["OUT-1"]).status_code == 201
+    assert processing(client, "P2", "EQ-1",
+                      "2026-01-02T10:00:00Z", "2026-01-02T11:00:00Z",
+                      ["RM-OAT"], ["OUT-2"]).status_code == 201
+    if verified_cleaning:
+        cid = client.post("/cleanings", json={
+            "equipment_id": "EQ-1", "cleaned_at": "2026-01-02T09:30:00Z",
+            "verified": True}).json()["id"]
+        return cid
+
+
+def test_preview_does_not_persist(client):
+    cid = _two_step_line(client)
+    r = client.post(f"/previews/cleanings/{cid}/revocation")
+    assert r.status_code == 200
+    pv = r.json()
+    assert pv["applied"] is False
+    assert pv["credential"]["token"]
+    assert pv["credential"]["expires_at"]
+    # 预演不落库：清洗仍有效、实时结论无 milk
+    assert client.get(f"/cleanings/{cid}").json()["revoked"] is False
+    assert client.get("/batches/OUT-2/trace").json()["allergens"] == ["gluten"]
+    # 预演结果显示撤销后 milk 经设备残留恢复
+    entry = pv["affected_batches"][0]
+    assert entry["batch_id"] == "OUT-2"
+    assert entry["changes"]["allergens"] == {"added": ["milk"], "removed": []}
+    milk_paths = entry["after"]["allergen_paths"]["milk"]
+    assert milk_paths[0][-1]["via"] == "equipment_residue"
+    assert entry["changes"]["basis"]["cleanings"] == {"added": [], "removed": [cid]}
+
+
+def test_preview_shows_issued_label_differences(client):
+    cid = _two_step_line(client)
+    label = client.post("/batches/OUT-2/labels", json={}).json()  # 签发于 milk 已清除
+    pv = client.post(f"/previews/cleanings/{cid}/revocation").json()
+    entry = [b for b in pv["affected_batches"] if b["batch_id"] == "OUT-2"][0]
+    # 变更前与标签一致；变更后标签相对实时结论出现 milk 差异
+    vs_before = entry["issued_labels"]["vs_before"]["labels"][0]
+    vs_after = entry["issued_labels"]["vs_after"]["labels"][0]
+    assert vs_before["label_id"] == label["label_id"]
+    assert vs_before["identical"] is True
+    assert vs_after["identical"] is False
+    assert vs_after["differences"]["allergens"] == {
+        "added_realtime": ["milk"], "removed_realtime": []}
+    assert "milk" in vs_after["differences"]["allergen_paths_changed"]
+
+
+def test_preview_commit_applies_atomically_and_returns_actual_impact(client):
+    cid = _two_step_line(client)
+    pv = client.post(f"/previews/cleanings/{cid}/revocation").json()
+    r = client.post("/previews/commit", json={"credential": pv["credential"]["token"]})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["applied"] is True
+    assert body["credential"] is None
+    assert body["change"]["current"]["revoked"] is True
+    assert body["affected_count"] == 1
+    assert "milk" in client.get("/batches/OUT-2/trace").json()["allergens"]
+
+
+def test_unrelated_updates_do_not_invalidate_credential(client):
+    cid = _two_step_line(client)
+    pv = client.post(f"/previews/cleanings/{cid}/revocation").json()
+    # 无关设备上的加工/清洗、无关原料声明、对受影响批次新签发标签均不使凭据失效
+    material(client, "RM-X", allergens=["soy"])
+    assert processing(client, "PX", "EQ-9",
+                      "2026-01-02T08:00:00Z", "2026-01-02T09:00:00Z",
+                      ["RM-X"], ["OUT-X"]).status_code == 201
+    client.post("/cleanings", json={
+        "equipment_id": "EQ-9", "cleaned_at": "2026-01-02T07:30:00Z",
+        "verified": False})
+    client.post("/batches/OUT-2/labels", json={})
+    r = client.post("/previews/commit", json={"credential": pv["credential"]["token"]})
+    assert r.status_code == 200
+    assert r.json()["affected_batches"][0]["batch_id"] == "OUT-2"
+
+
+def test_changed_relevant_record_rejects_commit(client):
+    cid = _two_step_line(client)
+    pv = client.post(f"/previews/cleanings/{cid}/revocation").json()
+    # 通过既有接口先行撤销 → 影响本次差异的记录已变化
+    assert client.post(f"/cleanings/{cid}/revoke").status_code == 200
+    r = client.post("/previews/commit", json={"credential": pv["credential"]["token"]})
+    assert r.status_code == 409
+
+
+def test_new_affected_downstream_after_preview_rejects_commit(client):
+    cid = _two_step_line(client)
+    # 预演时只有 OUT-2 受影响
+    pv = client.post(f"/previews/cleanings/{cid}/revocation").json()
+    assert [b["batch_id"] for b in pv["affected_batches"]] == ["OUT-2"]
+    # 在预演后、提交前插入一个新的受影响下游 P3（撤销后 milk 沿残留链继续传播）
+    assert processing(client, "P3", "EQ-1",
+                      "2026-01-02T12:00:00Z", "2026-01-02T13:00:00Z",
+                      ["RM-OAT"], ["OUT-3"]).status_code == 201
+    r = client.post("/previews/commit", json={"credential": pv["credential"]["token"]})
+    assert r.status_code == 409
+    assert "重新预演" in r.json()["detail"]
+    # 被拒绝后原状态保持
+    assert client.get(f"/cleanings/{cid}").json()["revoked"] is False
+
+
+def test_declaration_preview_allergen_and_pending_paths(client):
+    material(client, "RM-P", allergens=["milk"])
+    assert processing(client, "P1", "EQ-1",
+                      "2026-01-02T08:00:00Z", "2026-01-02T09:00:00Z",
+                      ["RM-P"], ["OUT-1"]).status_code == 201
+    r = client.post("/previews/material-declarations", json={
+        "batch_id": "RM-P", "allergens": ["milk", "peanut"], "pending": True})
+    assert r.status_code == 200
+    pv = r.json()
+    assert pv["change"]["current"]["version"] == 1
+    assert pv["change"]["proposed"]["version"] == 2
+    affected = {b["batch_id"]: b for b in pv["affected_batches"]}
+    assert set(affected) == {"RM-P", "OUT-1"}
+    ch = affected["OUT-1"]["changes"]
+    assert ch["allergens"] == {"added": ["peanut"], "removed": []}
+    assert ch["pending"] == {"before": False, "after": True}
+    assert ch["pending_paths"]["added_paths"][0][-1]["via"] == "input"
+    assert ch["basis"]["material_declarations"]["RM-P"]["after"]["version"] == 2
+    # 提交后新版本落库、实时结论更新
+    r = client.post("/previews/commit", json={"credential": pv["credential"]["token"]})
+    assert r.status_code == 200
+    assert r.json()["change"]["proposed"]["version"] == 2
+    t = client.get("/batches/OUT-1/trace").json()
+    assert t["allergens"] == ["milk", "peanut"]
+    assert t["pending"] is True
+    assert client.get("/materials/RM-P").json()["version"] == 2
+
+
+def test_declaration_preview_residue_propagation_and_label_freeze(client):
+    _two_step_line(client, verified_cleaning=False)
+    label = client.post("/batches/OUT-2/labels", json={}).json()  # 冻结含 milk 的结论
+    pv = client.post("/previews/material-declarations", json={
+        "batch_id": "RM-MILK", "allergens": []}).json()  # 更正为不含 milk
+    entry = [b for b in pv["affected_batches"] if b["batch_id"] == "OUT-2"][0]
+    # 实时预演中 milk（含残留路径）消失
+    assert entry["changes"]["allergens"] == {"added": [], "removed": ["milk"]}
+    assert entry["changes"]["allergen_paths"]["milk"]["removed_paths"][0][-1][
+        "via"] == "equipment_residue"
+    # 已签发标签相对“变更后实时结论”显示 milk 差异，但标签本身不改写
+    lab_diff = entry["issued_labels"]["vs_after"]["labels"][0]
+    assert lab_diff["identical"] is False
+    assert lab_diff["differences"]["allergens"] == {
+        "added_realtime": [], "removed_realtime": ["milk"]}
+    assert client.post(
+        "/previews/commit", json={"credential": pv["credential"]["token"]}
+    ).status_code == 200
+    assert client.get("/batches/OUT-2/trace").json()["allergens"] == ["gluten"]
+    frozen = client.get(f"/labels/{label['label_id']}").json()
+    assert frozen["conclusion"]["allergens"] == ["gluten", "milk"]
+
+
+def test_preview_errors_follow_existing_semantics(client):
+    # 无效目标
+    assert client.post("/previews/material-declarations",
+                       json={"batch_id": "GHOST"}).status_code == 404
+    assert client.post("/previews/cleanings/999/revocation").status_code == 404
+    # 请求格式错误（缺 batch_id）
+    assert client.post("/previews/material-declarations",
+                       json={"allergens": ["x"]}).status_code == 422
+    # 重复撤销沿用 409
+    cid = client.post("/cleanings", json={
+        "equipment_id": "EQ-1", "cleaned_at": "2026-01-02T09:30:00Z",
+        "verified": True}).json()["id"]
+    client.post(f"/cleanings/{cid}/revoke")
+    assert client.post(f"/previews/cleanings/{cid}/revocation").status_code == 409
+    # 凭据非法
+    assert client.post("/previews/commit", json={"credential": "garbage"}
+                       ).status_code == 400
+
+
+def test_preview_credential_tamper_rejected(client):
+    material(client, "RM-1", allergens=["milk"])
+    pv = client.post("/previews/material-declarations",
+                     json={"batch_id": "RM-1", "allergens": ["egg"]}).json()
+    body, sig = pv["credential"]["token"].split(".", 1)
+    import base64
+    import json as _json
+    payload = _json.loads(base64.urlsafe_b64decode(body))
+    payload["change"]["allergens"] = ["peanut"]  # 篡改拟变更内容
+    forged = base64.urlsafe_b64encode(
+        _json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).decode()
+    r = client.post("/previews/commit", json={"credential": f"{forged}.{sig}"})
+    assert r.status_code == 400
+
+
+def test_existing_correction_revoke_and_label_apis_still_compatible(client):
+    cid = _two_step_line(client)
+    # 既有声明更正接口照常追加版本
+    r = client.post("/materials/RM-OAT/declarations",
+                    json={"allergens": ["gluten", "sesame"]})
+    assert r.status_code == 201
+    # 既有清洗撤销接口照常工作
+    assert client.post(f"/cleanings/{cid}/revoke").status_code == 200
+    # 既有 trace / 标签接口照常
+    t = client.get("/batches/OUT-2/trace").json()
+    assert set(t["allergens"]) == {"gluten", "milk", "sesame"}
+    assert client.get("/batches/OUT-2/labels").status_code == 200
+
